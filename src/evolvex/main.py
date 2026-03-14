@@ -10,6 +10,7 @@ from evolvex.search_algorithms import GA_search, systematic_search
 from evolvex.model_generation import generate_initial_models
 from evolvex.dask_parallel import wait_and_remove
 from evolvex.command_line_interface import command_line_interface
+from evolvex.utils import batch_compress_PDB_files
 
 def main():
     """
@@ -78,7 +79,11 @@ def main():
         initial_models_population = generate_initial_models(parallel_executor, evolvex_working_dir, backbone_PDB_files_paths, GLOBALS)
 
         print('Running search...', flush=True)
-        GA_search(parallel_executor, initial_models_population, generated_models_info_file_path, model_PDB_files_dir, GLOBALS)
+        try:
+            GA_search(parallel_executor, initial_models_population, generated_models_info_file_path, model_PDB_files_dir, GLOBALS)
+        finally:
+            print('Compressing PDB files...', flush=True)
+            batch_compress_PDB_files(model_PDB_files_dir)
 
 
     print('Finished.', flush=True)

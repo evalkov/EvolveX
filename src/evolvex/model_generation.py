@@ -157,10 +157,10 @@ def generate_random_model(
 
         complex_stability_ddG = get_complex_stability_ddG(model_dir / f'Dif_{PDB_name}_1_Alanine_mutant.fxout')
         if complex_stability_ddG < 0.5 or n_tries == 5:
-            full_residue_IDs_list = [f'{mut_name[-1]}{mut_name[1:-1]}' for mut_name in random_mutations_list]
+            full_residue_IDs = {mut_name[1:-1]: mut_name[-1] for mut_name in random_mutations_list}
             model = MC_Model(
                 model_dir = model_dir,
-                full_residue_IDs_list = full_residue_IDs_list,
+                full_residue_IDs = full_residue_IDs,
                 backbone_PDB_file_name = PDB_name,
                 antibody_stability_dG_original_wildtype = antibody_stability_dG_original_wildtype,
                 antibody_seq_map_original_wildtype = antibody_seq_map_original_wildtype,

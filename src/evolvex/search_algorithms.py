@@ -1,4 +1,5 @@
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import itertools
 import math
 import random
@@ -7,19 +8,41 @@ import pandas as pd
 from dask.distributed import as_completed
 
 from evolvex.dask_parallel import wait_and_remove
-from evolvex.foldx_commands import (get_binding_dG,
-                          get_chain_group_intraclash_score, get_complex_stability_dG,
-                          get_chain_group_stability_dG,
-                          run_foldx_AnalyseComplex,
-                          run_foldx_Stability, get_all_other_interaction_file_info)
+from evolvex.foldx_commands import (get_chain_group_stability_dG,
+                          get_complex_stability_dG_from_raw,
+                          get_complex_stability_ddG,
+                          parse_interaction_file,
+                          run_foldx_AnalyseComplex)
 from evolvex.model_generation import clean_up_model_dir, create_model
 from evolvex.model_generation import get_acceptable_positions_mut_names_map, get_hotspot_positions_mut_names_map
-from evolvex.utils import save_compressed_PDB_file
+from evolvex.utils import save_PDB_file_copy
 
 from evolvex.utils import NDIGIS_ROUNDING
 
 paratope_AA =         [ 'A', 'C',  'D',  'E', 'F',  'G',  'H',  'I',  'K',  'L', 'M',  'N', 'P', 'Q',  'R',   'S',  'T', 'V', 'W',  'Y']
 paratope_AA_weights = [2.95, 0.1, 6.75, 2.85, 3.9, 7.75, 2.95, 2.75, 2.55, 3.55, 0.7, 7.75, 1.9, 2.2, 5.15, 13.45, 5.85, 2.5, 5.3, 19.1]
+_paratope_AA_weight_map = dict(zip(paratope_AA, paratope_AA_weights))
+
+MAX_SYSTEMATIC_COMBINATIONS = 1_000_000
+
+
+def _get_combinations(values_lists, max_combinations=MAX_SYSTEMATIC_COMBINATIONS):
+    """Return combinations from values_lists, sampling randomly if the space exceeds max_combinations."""
+    if not values_lists:
+        return [()]
+
+    total = 1
+    for vl in values_lists:
+        total *= len(vl)
+        if total > max_combinations:
+            break
+
+    if total <= max_combinations:
+        result = list(itertools.product(*values_lists))
+        random.shuffle(result)
+        return result
+    else:
+        return [tuple(random.choice(vl) for vl in values_lists) for _ in range(max_combinations)]
 
 
 def all_hotspot_and_acceptable_mutations_combinations_generator(all_mutations_summary_file_path):
@@ -28,84 +51,57 @@ def all_hotspot_and_acceptable_mutations_combinations_generator(all_mutations_su
     """
     all_mutations_summary_df = pd.read_csv(all_mutations_summary_file_path, header=0, index_col=0)
 
-    acceptable_positions_mut_names_map = get_acceptable_positions_mut_names_map(all_mutations_summary_df)
+    PDB_name = all_mutations_summary_file_path.parent.parent.name
+    acceptable_positions_mut_names_map = get_acceptable_positions_mut_names_map(all_mutations_summary_df, PDB_name)
     hotspot_positions_mut_names_map = get_hotspot_positions_mut_names_map(all_mutations_summary_df)
-    
+
     # Remove hotspot positions from acceptable positions
     for position in hotspot_positions_mut_names_map.keys():
         del acceptable_positions_mut_names_map[position]
 
     ### NOTE: This only explores combinations of mutations in one order, do we want to get mutation order variability for BuildModel ? Would need to additionally use itertools.combinations.
-    all_hotspot_mutations_combinations = list(itertools.product(*hotspot_positions_mut_names_map.values())) # hotspot_positions_mut_names_map.values() returns a list of sublists, where each sublist are the mutations for a given position
+    all_hotspot_mutations_combinations = _get_combinations(list(hotspot_positions_mut_names_map.values()))
     if len(all_hotspot_mutations_combinations) == 0:
-        all_hotspot_mutations_combinations = [[]]
-    random.shuffle(all_hotspot_mutations_combinations)
+        all_hotspot_mutations_combinations = [()]
 
-    all_acceptable_mutations_combinations = list(itertools.product(*acceptable_positions_mut_names_map.values()))
+    all_acceptable_mutations_combinations = _get_combinations(list(acceptable_positions_mut_names_map.values()))
     if len(all_acceptable_mutations_combinations) == 0:
-        all_acceptable_mutations_combinations = [[]]
-    random.shuffle(all_acceptable_mutations_combinations)
+        all_acceptable_mutations_combinations = [()]
 
     for hotspot_mutations_list in all_hotspot_mutations_combinations:
         for acceptable_mutations_list in all_acceptable_mutations_combinations:
             mutations_list = hotspot_mutations_list + acceptable_mutations_list
 
             yield mutations_list
-    
+
     return
 
-def run_foldx_commands(mutant_PDB_file_path, wildtype_PDB_file_path, antibody_chains, antigen_chains, output_dir, GLOBALS):    
-    run_foldx_AnalyseComplex(
-        GLOBALS.foldx_dir,
-        mutant_PDB_file_path.parent, mutant_PDB_file_path.stem,
-        antibody_chains, antigen_chains,
-        GLOBALS.vdwDesign,
-        GLOBALS.print_stdout,
-        output_dir, output_file_tag=None
-    )
-    run_foldx_AnalyseComplex(
-        GLOBALS.foldx_dir,
-        wildtype_PDB_file_path.parent, wildtype_PDB_file_path.stem,
-        antibody_chains, antigen_chains,
-        GLOBALS.vdwDesign,
-        GLOBALS.print_stdout,
-        output_dir, output_file_tag=None
-    )
-
-    run_foldx_Stability(
-        GLOBALS.foldx_dir,
-        mutant_PDB_file_path.parent, mutant_PDB_file_path.stem,
-        GLOBALS.vdwDesign,
-        GLOBALS.print_stdout,
-        output_dir, output_file_tag=None
-    )
-    run_foldx_Stability(
-        GLOBALS.foldx_dir,
-        wildtype_PDB_file_path.parent, wildtype_PDB_file_path.stem,
-        GLOBALS.vdwDesign,
-        GLOBALS.print_stdout,
-        output_dir, output_file_tag=None
-    )
-
+def run_foldx_commands(mutant_PDB_file_path, wildtype_PDB_file_path, antibody_chains, antigen_chains, output_dir, GLOBALS):
+    # Phase 1A: Stability calls removed — complex stability is read from BuildModel Raw_/Dif_ files instead
+    # Phase 2A: AnalyseComplex calls run in parallel via ThreadPoolExecutor
+    tasks = [
+        (mutant_PDB_file_path, None, False),
+        (wildtype_PDB_file_path, None, False),
+    ]
     if GLOBALS.calculate_binding_dG_with_water:
+        tasks.append((mutant_PDB_file_path, 'mutant_with_waters', True))
+        tasks.append((wildtype_PDB_file_path, 'wildtype_with_waters', True))
+
+    def run_analyse_complex(pdb_path, output_file_tag, with_predicted_waters):
         run_foldx_AnalyseComplex(
             GLOBALS.foldx_dir,
-            mutant_PDB_file_path.parent, mutant_PDB_file_path.stem,
+            pdb_path.parent, pdb_path.stem,
             antibody_chains, antigen_chains,
             GLOBALS.vdwDesign,
             GLOBALS.print_stdout,
-            output_dir, output_file_tag='mutant_with_waters',
-            with_predicted_waters=True
+            output_dir, output_file_tag=output_file_tag,
+            with_predicted_waters=with_predicted_waters
         )
-        run_foldx_AnalyseComplex(
-            GLOBALS.foldx_dir,
-            wildtype_PDB_file_path.parent, wildtype_PDB_file_path.stem,
-            antibody_chains, antigen_chains,
-            GLOBALS.vdwDesign,
-            GLOBALS.print_stdout,
-            output_dir, output_file_tag='wildtype_with_waters',
-            with_predicted_waters=True
-        )
+
+    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+        futures = [executor.submit(run_analyse_complex, *task) for task in tasks]
+        for future in futures:
+            future.result()
 
     return
 
@@ -128,103 +124,108 @@ def systematic_search(parallel_executor, backbone_PDB_files_paths, evolvex_worki
                 create_model, foldx_Alanine_mutant_PDB_file_path, True, mutations_list, output_dir, GLOBALS,
             )
             futures.append(future)
-        
+
         wait_and_remove(parallel_executor, futures)
-    
+
     return
 
 
-def get_random_mut_name(full_residue_IDs_list, allowed_AA_mutations_per_position_map):
-    random_residue_ID = random.choice(full_residue_IDs_list)
-    wildtype_AA, residue_ID, position = random_residue_ID[0], random_residue_ID[1:], random_residue_ID[2:]
+def get_random_mut_name(full_residue_IDs, allowed_AA_mutations_per_position_map):
+    residue_ID = random.choice(list(full_residue_IDs.keys()))
+    wildtype_AA = full_residue_IDs[residue_ID]
+    position = residue_ID[1:]
 
     allowed_mutations = allowed_AA_mutations_per_position_map[position]
     if len(allowed_mutations) == 1:
-        # Can't index a set, and there is only one mutation, so this works
-        for mutant_AA in allowed_mutations:
-            pass
+        (mutant_AA,) = allowed_mutations
     else:
-        mutant_AA = random.choices(paratope_AA, paratope_AA_weights)[0]
-        while not mutant_AA in allowed_mutations:
-            mutant_AA = random.choices(paratope_AA, paratope_AA_weights)[0]
-    
+        # Phase 1D: Pre-filter to allowed AAs instead of rejection sampling
+        filtered = [(aa, _paratope_AA_weight_map[aa]) for aa in paratope_AA if aa in allowed_mutations]
+        mutant_AA = random.choices([x[0] for x in filtered], [x[1] for x in filtered])[0]
+
     return f'{wildtype_AA}{residue_ID}{mutant_AA}'
 
 def metropolis_criterion(energies):
     if any(energy < 0 for energy in energies):
         return True
-    
+
     U = random.random()
     for energy in energies:
         P = math.exp(-(energy / 0.5919))
         if P >= U:
             return True
-        
+
     return False
 
 def keep_mutant_decision(model_dir, antibody_chains, antigen_chains, antibody_stability_dG_original_wildtype, iteration_fraction, generated_models_info, GLOBALS):
-    # Calculate energies and scores
+    # Antibody stability from AnalyseComplex Indiv_ files
     wildtype_antibody_stability_dG = get_chain_group_stability_dG(indiv_file_path = model_dir / 'Indiv_energies_WT_model_1_AC.fxout', chain_group_name = antibody_chains)
     mutant_antibody_stability_dG = get_chain_group_stability_dG(indiv_file_path = model_dir / 'Indiv_energies_model_1_AC.fxout', chain_group_name = antibody_chains)
     antibody_stability_ddG = round(mutant_antibody_stability_dG - wildtype_antibody_stability_dG, NDIGIS_ROUNDING)
 
-    wildtype_complex_stability_dG = get_complex_stability_dG(st_file_path = model_dir / 'WT_model_1_0_ST.fxout')
-    mutant_complex_stability_dG = get_complex_stability_dG(st_file_path = model_dir / 'model_1_0_ST.fxout')
+    # Phase 1A: Complex stability from BuildModel Raw_/Dif_ files (no Stability command needed)
+    mutant_complex_stability_dG = get_complex_stability_dG_from_raw(raw_file_path = model_dir / 'Raw_model.fxout')
+    complex_stability_ddG_value = get_complex_stability_ddG(dif_file_path = model_dir / 'Dif_model.fxout')
+    wildtype_complex_stability_dG = round(mutant_complex_stability_dG - complex_stability_ddG_value, NDIGIS_ROUNDING)
 
-    wildtype_binding_dG = get_binding_dG(interaction_file_path = model_dir / f'Interaction_WT_model_1_AC.fxout')
-    mutant_binding_dG = get_binding_dG(interaction_file_path = model_dir / f'Interaction_model_1_AC.fxout')
-    binding_ddG = round(mutant_binding_dG - wildtype_binding_dG, NDIGIS_ROUNDING)
-    
+    # Phase 1B: Parse wildtype interaction file once (always needed for logging)
+    wt_interaction = parse_interaction_file(interaction_file_path = model_dir / 'Interaction_WT_model_1_AC.fxout')
     if GLOBALS.calculate_binding_dG_with_water:
-        wildtype_binding_dG_with_waters = get_binding_dG(interaction_file_path = model_dir / f'Interaction_wildtype_with_waters_AC.fxout')
-        mutant_binding_dG_with_waters = get_binding_dG(interaction_file_path = model_dir / f'Interaction_mutant_with_waters_AC.fxout')
-        binding_ddG_with_waters = round(mutant_binding_dG_with_waters - wildtype_binding_dG_with_waters, NDIGIS_ROUNDING)
+        wt_water_interaction = parse_interaction_file(interaction_file_path = model_dir / 'Interaction_wildtype_with_waters_AC.fxout')
 
-    wildtype_antibody_intraclash_score = get_chain_group_intraclash_score(interaction_file_path = model_dir / f'Interaction_WT_model_1_AC.fxout', chain_group_name = antibody_chains)
-    mutant_antibody_intraclash_score = get_chain_group_intraclash_score(interaction_file_path = model_dir / f'Interaction_model_1_AC.fxout', chain_group_name = antibody_chains)
-    antibody_delta_intraclash_score = round(mutant_antibody_intraclash_score - wildtype_antibody_intraclash_score, NDIGIS_ROUNDING)
-
-    # All columns from interactions file, starting from Backbone Hbond
-    wildtype_other_info_map = get_all_other_interaction_file_info(interaction_file_path = model_dir / f'Interaction_WT_model_1_AC.fxout')
-    mutant_other_info_map = get_all_other_interaction_file_info(interaction_file_path = model_dir / f'Interaction_model_1_AC.fxout')
-
-    
-    # Make decision
+    # Phase 1C: Early rejection on antibody stability (skip mutant interaction file read)
     if antibody_stability_ddG > 0.5 or mutant_antibody_stability_dG > (antibody_stability_dG_original_wildtype + 2):
-        keep_mutant =  False
-    
-    elif antibody_delta_intraclash_score > 0.5 or mutant_antibody_intraclash_score > 10:
-        keep_mutant =  False
-    
+        keep_mutant = False
     else:
-        energies = (binding_ddG, binding_ddG_with_waters) if GLOBALS.calculate_binding_dG_with_water else (binding_ddG,)
-        keep_mutant = metropolis_criterion(energies)
+        # Parse mutant interaction file only if stability passed (Phase 1B + 1C)
+        mut_interaction = parse_interaction_file(interaction_file_path = model_dir / 'Interaction_model_1_AC.fxout')
 
-    # Log info of the selected model. This bit of code is uggly, but couldn't find a better way.
-    generated_models_info['antibody_stability_dG'].append(mutant_antibody_stability_dG if keep_mutant else wildtype_antibody_stability_dG)
-    generated_models_info['complex_stability_dG'].append(mutant_complex_stability_dG if keep_mutant else wildtype_complex_stability_dG)
-    generated_models_info['binding_dG'].append(mutant_binding_dG if keep_mutant else wildtype_binding_dG)
-    if GLOBALS.calculate_binding_dG_with_water:
-        generated_models_info['binding_dG_with_waters'].append(mutant_binding_dG_with_waters if keep_mutant else wildtype_binding_dG_with_waters)
-    generated_models_info['antibody_intraclash_score'].append(mutant_antibody_intraclash_score if keep_mutant else wildtype_antibody_intraclash_score)
-    
-    other_info_map = mutant_other_info_map if keep_mutant else wildtype_other_info_map
-    for key, value in other_info_map.items():
+        mutant_antibody_intraclash_score = mut_interaction['intraclash_scores'][antibody_chains]
+        wildtype_antibody_intraclash_score = wt_interaction['intraclash_scores'][antibody_chains]
+        antibody_delta_intraclash_score = round(mutant_antibody_intraclash_score - wildtype_antibody_intraclash_score, NDIGIS_ROUNDING)
+
+        if antibody_delta_intraclash_score > 0.5 or mutant_antibody_intraclash_score > 10:
+            keep_mutant = False
+        else:
+            binding_ddG = round(mut_interaction['binding_dG'] - wt_interaction['binding_dG'], NDIGIS_ROUNDING)
+
+            if GLOBALS.calculate_binding_dG_with_water:
+                mut_water_interaction = parse_interaction_file(interaction_file_path = model_dir / 'Interaction_mutant_with_waters_AC.fxout')
+                binding_ddG_with_waters = round(mut_water_interaction['binding_dG'] - wt_water_interaction['binding_dG'], NDIGIS_ROUNDING)
+                energies = (binding_ddG, binding_ddG_with_waters)
+            else:
+                energies = (binding_ddG,)
+            keep_mutant = metropolis_criterion(energies)
+
+    # Log info of the selected model
+    if keep_mutant:
+        generated_models_info['antibody_stability_dG'].append(mutant_antibody_stability_dG)
+        generated_models_info['complex_stability_dG'].append(mutant_complex_stability_dG)
+        generated_models_info['binding_dG'].append(mut_interaction['binding_dG'])
+        if GLOBALS.calculate_binding_dG_with_water:
+            generated_models_info['binding_dG_with_waters'].append(mut_water_interaction['binding_dG'])
+        generated_models_info['antibody_intraclash_score'].append(mut_interaction['intraclash_scores'][antibody_chains])
+        other_info = mut_interaction['other_info']
+    else:
+        generated_models_info['antibody_stability_dG'].append(wildtype_antibody_stability_dG)
+        generated_models_info['complex_stability_dG'].append(wildtype_complex_stability_dG)
+        generated_models_info['binding_dG'].append(wt_interaction['binding_dG'])
+        if GLOBALS.calculate_binding_dG_with_water:
+            generated_models_info['binding_dG_with_waters'].append(wt_water_interaction['binding_dG'])
+        generated_models_info['antibody_intraclash_score'].append(wt_interaction['intraclash_scores'][antibody_chains])
+        other_info = wt_interaction['other_info']
+
+    for key, value in other_info.items():
         key = key.replace(' ', '_') # Backbone Hbond => Backbone_Hbond
         generated_models_info[key].append(value)
 
-    #
-
     return keep_mutant
 
-def update_full_residue_IDs_list(model, mut_names_list):
+def update_full_residue_IDs(model, mut_names_list):
     for mut_name in mut_names_list:
-        wildtype_AA, residue_ID, mutant_AA = mut_name[0], mut_name[1:-1], mut_name[-1]
-        old_residue_ID = f'{wildtype_AA}{residue_ID}'
-        new_residue_ID = f'{mutant_AA}{residue_ID}'
-
-        model.full_residue_IDs_list.remove(old_residue_ID)
-        model.full_residue_IDs_list.append(new_residue_ID)
+        residue_ID = mut_name[1:-1]
+        mutant_AA = mut_name[-1]
+        model.full_residue_IDs[residue_ID] = mutant_AA
 
     return
 
@@ -245,8 +246,8 @@ def make_MC_steps(model, n_MC_steps, nth_loop, iteration_fraction, model_PDB_fil
         nth_iteration = current_nth_MC_iteration + i + 1
         generated_models_info['nth_iteration'].append(nth_iteration)
 
-        full_residue_IDs_list = model.full_residue_IDs_list
-        mut_name = get_random_mut_name(full_residue_IDs_list, allowed_AA_mutations_per_position_map)
+        full_residue_IDs = model.full_residue_IDs
+        mut_name = get_random_mut_name(full_residue_IDs, allowed_AA_mutations_per_position_map)
 
         # Create the mutant with BuildModel, which will be called "model_1"
         model_dir = model.model_dir
@@ -256,25 +257,26 @@ def make_MC_steps(model, n_MC_steps, nth_loop, iteration_fraction, model_PDB_fil
 
         run_foldx_commands(
             mutant_PDB_file_path = model_dir / 'model_1.pdb', wildtype_PDB_file_path = model_dir / 'WT_model_1.pdb',
-            antibody_chains = antibody_chains, antigen_chains = antigen_chains, 
+            antibody_chains = antibody_chains, antigen_chains = antigen_chains,
             output_dir = model_dir, GLOBALS = GLOBALS
         )
 
         keep_mutant = keep_mutant_decision(model_dir, antibody_chains, antigen_chains, antibody_stability_dG_original_wildtype, iteration_fraction, generated_models_info, GLOBALS)
         if keep_mutant:
             clean_up_model_dir(model_dir, PDB_file_name_to_keep_as_model = 'model_1.pdb')
-            update_full_residue_IDs_list(model, mut_names_list = [mut_name])
-        
+            update_full_residue_IDs(model, mut_names_list = [mut_name])
+
         else:
             clean_up_model_dir(model_dir, PDB_file_name_to_keep_as_model = 'model.pdb')
-        
-        save_compressed_PDB_file(
-            PDB_file_path = model_dir / 'model.pdb', 
+
+        # Phase 2B: Copy PDB without compression (batch compression happens after search)
+        save_PDB_file_copy(
+            PDB_file_path = model_dir / 'model.pdb',
             output_name = f'{backbone_PDB_file_name}_{model.model_dir.name}_{nth_iteration}.pdb',
             output_dir = model_PDB_files_dir
         )
 
-        generated_models_info['residue_IDs'].append(';'.join(full_residue_IDs_list))
+        generated_models_info['residue_IDs'].append(';'.join(f'{aa}{rid}' for rid, aa in full_residue_IDs.items()))
         generated_models_info['from_mut_name'].append(mut_name)
         generated_models_info['mutation_accepted'].append(keep_mutant)
 
@@ -290,7 +292,7 @@ def write_generated_models_info(generated_models_info, generated_models_info_fil
         f"{','.join(map(str, row_of_values))}\n" # row CSV format
         for row_of_values in zip(*generated_models_info.values()) # if generated_models_info = {'A':[1,2,3], 'B':[4,5,6]}, zip(*generated_models_info.values()) yields (1,4), (2,5) and (3,6)
     )
-    
+
     generated_models_info_file_handle.writelines(lines)
     return
 
@@ -309,11 +311,12 @@ def random_model_pairing_generator(models_population):
     return
 
 def get_recombination_mut_names(model_1, model_2):
-    residue_ID_to_AA_map_1 = {full_residue_ID[1:]:full_residue_ID[0] for full_residue_ID in model_1.full_residue_IDs_list} # e.g {'H52':'K', 'H56':'Y', ...}
-    residue_ID_to_AA_map_2 = {full_residue_ID[1:]:full_residue_ID[0] for full_residue_ID in model_2.full_residue_IDs_list}
+    # Phase 3C: full_residue_IDs is already a dict mapping residue_ID -> AA
+    residue_ID_to_AA_map_1 = model_1.full_residue_IDs
+    residue_ID_to_AA_map_2 = model_2.full_residue_IDs
 
-    shared_residue_IDs = set.intersection(set(residue_ID_to_AA_map_1.keys()), set(residue_ID_to_AA_map_2.keys()))
-    sorted_shared_residue_IDs = sorted(shared_residue_IDs, key = lambda residue_ID:(residue_ID[0], int(residue_ID[1:]))) 
+    shared_residue_IDs = set(residue_ID_to_AA_map_1.keys()) & set(residue_ID_to_AA_map_2.keys())
+    sorted_shared_residue_IDs = sorted(shared_residue_IDs, key = lambda residue_ID:(residue_ID[0], int(residue_ID[1:])))
     if len(sorted_shared_residue_IDs) < 2:
         raise ValueError(f'Cannot perform recombination between {model_1.model_dir} and {model_2.model_dir} because {shared_residue_IDs = }, and at least 2 shared residue IDs are needed.')
 
@@ -344,36 +347,37 @@ def make_recombination_step(model_1, model_2, nth_iteration, iteration_fraction,
     mut_names_1, mut_names_2 = get_recombination_mut_names(model_1, model_2)
     for mut_names, model in [(mut_names_1, model_1), (mut_names_2, model_2)]:
         model_dir = model.model_dir
-        full_residue_IDs_list = model.full_residue_IDs_list
+        full_residue_IDs = model.full_residue_IDs
 
         create_model(
             input_PDB_file_path = model_dir / 'model.pdb', copy_PDB_file_to_output_dir = False, mutations_list = mut_names, output_dir = model_dir, GLOBALS = GLOBALS
         )
 
         run_foldx_commands(
-            mutant_PDB_file_path = model_dir / 'model_1.pdb', wildtype_PDB_file_path = model_dir / 'WT_model_1.pdb', 
-            antibody_chains = antibody_chains, antigen_chains = antigen_chains, 
+            mutant_PDB_file_path = model_dir / 'model_1.pdb', wildtype_PDB_file_path = model_dir / 'WT_model_1.pdb',
+            antibody_chains = antibody_chains, antigen_chains = antigen_chains,
             output_dir = model_dir, GLOBALS = GLOBALS
         )
-        
+
         keep_mutant = keep_mutant_decision(model_dir, antibody_chains, antigen_chains, antibody_stability_dG_original_wildtype, iteration_fraction, generated_models_info, GLOBALS)
         if keep_mutant:
             clean_up_model_dir(model_dir, PDB_file_name_to_keep_as_model = 'model_1.pdb')
-            update_full_residue_IDs_list(model, mut_names_list = mut_names)
-        
+            update_full_residue_IDs(model, mut_names_list = mut_names)
+
         else:
             clean_up_model_dir(model_dir, PDB_file_name_to_keep_as_model = 'model.pdb')
 
-        save_compressed_PDB_file(
-            PDB_file_path = model_dir / 'model.pdb', 
+        # Phase 2B: Copy PDB without compression (batch compression happens after search)
+        save_PDB_file_copy(
+            PDB_file_path = model_dir / 'model.pdb',
             output_name = f'{backbone_PDB_file_name}_{model.model_dir.name}_{nth_iteration}.pdb',
             output_dir = model_PDB_files_dir
         )
 
-        generated_models_info['residue_IDs'].append(';'.join(full_residue_IDs_list))
+        generated_models_info['residue_IDs'].append(';'.join(f'{aa}{rid}' for rid, aa in full_residue_IDs.items()))
         generated_models_info['from_mut_name'].append(';'.join(mut_names))
         generated_models_info['mutation_accepted'].append(keep_mutant)
-    
+
     return model_1, model_2, generated_models_info
 
 def GA_search(parallel_executor, initial_models_population, generated_models_info_file_path, model_PDB_files_dir, GLOBALS):
@@ -401,7 +405,7 @@ def GA_search(parallel_executor, initial_models_population, generated_models_inf
             models_population.append(model)
             write_generated_models_info(generated_models_info, generated_models_info_file_handle)
         parallel_executor.cancel(futures)
-        
+
         # Recombination step. The models are recombined with a model from the same backbone.
         nth_iteration = (nth_loop + 1) * recombine_every_nth_iteration
         futures = []
