@@ -100,10 +100,18 @@ git -C "$REPO_ROOT" worktree add "$OLD_WORKTREE" "$OLD_COMMIT" 2>/dev/null || {
 }
 echo ""
 
+# --- Detect Python and site-packages ---
+# The worktree only contains EvolveX source code; third-party dependencies (dask,
+# biopython, pandas, etc.) come from the active virtual environment / system install.
+# We prepend the OLD or NEW src/ to PYTHONPATH so that `import evolvex` resolves to
+# the correct version, while all other packages resolve normally.
+SITE_PACKAGES="$(python3 -c 'import site; print(":".join(site.getsitepackages()))')"
+BASE_PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$SITE_PACKAGES"
+
 # --- Run OLD code ---
 echo "--- Running OLD code (pre-optimization) ---"
 OLD_START=$(date +%s)
-PYTHONPATH="$OLD_WORKTREE/src" python3 -m evolvex.main "$BENCH_DIR/config_old.yaml" 2>&1 | tee "$BENCH_DIR/old_stdout.log"
+PYTHONPATH="$OLD_WORKTREE/src:$BASE_PYTHONPATH" python3 -m evolvex.main "$BENCH_DIR/config_old.yaml" 2>&1 | tee "$BENCH_DIR/old_stdout.log"
 OLD_END=$(date +%s)
 OLD_ELAPSED=$((OLD_END - OLD_START))
 echo "OLD code finished in ${OLD_ELAPSED}s"
@@ -112,7 +120,7 @@ echo ""
 # --- Run NEW code ---
 echo "--- Running NEW code (optimized) ---"
 NEW_START=$(date +%s)
-PYTHONPATH="$REPO_ROOT/src" python3 -m evolvex.main "$BENCH_DIR/config_new.yaml" 2>&1 | tee "$BENCH_DIR/new_stdout.log"
+PYTHONPATH="$REPO_ROOT/src:$BASE_PYTHONPATH" python3 -m evolvex.main "$BENCH_DIR/config_new.yaml" 2>&1 | tee "$BENCH_DIR/new_stdout.log"
 NEW_END=$(date +%s)
 NEW_ELAPSED=$((NEW_END - NEW_START))
 echo "NEW code finished in ${NEW_ELAPSED}s"
