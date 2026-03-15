@@ -141,18 +141,44 @@ python3 "$REPO_ROOT/verification/validate_raw_files.py" \
     2>&1 | tee "$BENCH_DIR/raw_validation_report.txt"
 echo ""
 
+# --- Extract search-phase timing from logs (new code prints "GA search finished in Xs") ---
+NEW_SEARCH_TIME=$(grep -oP 'GA search finished in \K[0-9.]+' "$BENCH_DIR/new_stdout.log" 2>/dev/null || echo "")
+
 # --- Timing summary ---
 echo "=========================================="
 echo "         TIMING SUMMARY"
 echo "=========================================="
-echo "OLD (pre-optimization): ${OLD_ELAPSED}s"
-echo "NEW (optimized):        ${NEW_ELAPSED}s"
+echo ""
+echo "  End-to-end (includes setup, exploration, model generation):"
+echo "  OLD total: ${OLD_ELAPSED}s"
+echo "  NEW total: ${NEW_ELAPSED}s"
 if [ "$OLD_ELAPSED" -gt 0 ]; then
     SPEEDUP=$(echo "scale=2; $OLD_ELAPSED / $NEW_ELAPSED" | bc 2>/dev/null || echo "N/A")
     REDUCTION=$(echo "scale=1; (1 - $NEW_ELAPSED / $OLD_ELAPSED) * 100" | bc 2>/dev/null || echo "N/A")
-    echo "Speedup:                ${SPEEDUP}x"
-    echo "Time reduction:         ${REDUCTION}%"
+    echo "  Speedup:   ${SPEEDUP}x"
+    echo "  Reduction: ${REDUCTION}%"
 fi
+echo ""
+if [ -n "$NEW_SEARCH_TIME" ]; then
+    # Estimate old search time = old_total - (new_total - new_search)
+    # since the setup phases are ~identical between old and new
+    NEW_SETUP=$(echo "scale=1; $NEW_ELAPSED - $NEW_SEARCH_TIME" | bc 2>/dev/null || echo "")
+    if [ -n "$NEW_SETUP" ]; then
+        OLD_SEARCH_EST=$(echo "scale=1; $OLD_ELAPSED - $NEW_SETUP" | bc 2>/dev/null || echo "")
+        echo "  GA search phase only (where optimizations apply):"
+        echo "  OLD search (est): ${OLD_SEARCH_EST}s"
+        echo "  NEW search:       ${NEW_SEARCH_TIME}s"
+        if [ -n "$OLD_SEARCH_EST" ]; then
+            SEARCH_SPEEDUP=$(echo "scale=2; $OLD_SEARCH_EST / $NEW_SEARCH_TIME" | bc 2>/dev/null || echo "N/A")
+            SEARCH_REDUCTION=$(echo "scale=1; (1 - $NEW_SEARCH_TIME / $OLD_SEARCH_EST) * 100" | bc 2>/dev/null || echo "N/A")
+            echo "  Speedup:          ${SEARCH_SPEEDUP}x"
+            echo "  Reduction:        ${SEARCH_REDUCTION}%"
+        fi
+    fi
+fi
+echo ""
+echo "  NOTE: With 10 iterations / 2 models, setup dominates total time."
+echo "  Production runs (500 iter / 50 models) will show much larger gains."
 echo "=========================================="
 echo ""
 echo "Full results saved to: $BENCH_DIR"

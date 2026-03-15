@@ -8,8 +8,13 @@ def setup_dask_parallel_executor(GLOBALS):
     n_cores = GLOBALS.n_cores
 
     if compute_env == 'local':
+        # Use fewer workers with more cores each to leave headroom for
+        # intra-worker parallelism (e.g. parallel AnalyseComplex calls).
+        # Each worker runs up to 4 concurrent FoldX subprocesses.
+        foldx_parallelism = 4
+        n_workers = max(1, n_cores // foldx_parallelism)
         cluster = LocalCluster(
-            n_workers = n_cores,
+            n_workers = n_workers,
             threads_per_worker = 1,
             processes = True,
         )

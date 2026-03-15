@@ -1,3 +1,5 @@
+import time
+
 import pandas as pd
 
 from Bio.Data.IUPACData import protein_letters
@@ -79,9 +81,12 @@ def main():
         initial_models_population = generate_initial_models(parallel_executor, evolvex_working_dir, backbone_PDB_files_paths, GLOBALS)
 
         print('Running search...', flush=True)
+        search_start = time.time()
         try:
             GA_search(parallel_executor, initial_models_population, generated_models_info_file_path, model_PDB_files_dir, GLOBALS)
         finally:
+            search_elapsed = time.time() - search_start
+            print(f'GA search finished in {search_elapsed:.1f}s', flush=True)
             print('Compressing PDB files...', flush=True)
             batch_compress_PDB_files(model_PDB_files_dir)
 
