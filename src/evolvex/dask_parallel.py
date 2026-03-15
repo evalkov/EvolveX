@@ -31,10 +31,14 @@ def setup_dask_parallel_executor(GLOBALS):
         SLURM_info_files_dir = GLOBALS.working_dir / 'slurm_info_files'; SLURM_info_files_dir.mkdir()
 
         n_cores_per_job = math.ceil(n_cores / max_SLURM_jobs)
-        print(f'{max_SLURM_jobs} jobs, each running {n_cores_per_job} single core workers.', flush=True)
+        # Use fewer workers per job to leave headroom for intra-worker FoldX
+        # parallelism (up to 4 concurrent AnalyseComplex calls per worker).
+        foldx_parallelism = 4
+        n_workers_per_job = max(1, n_cores_per_job // foldx_parallelism)
+        print(f'{max_SLURM_jobs} jobs, each running {n_workers_per_job} workers on {n_cores_per_job} cores.', flush=True)
 
         cluster = SLURMCluster(
-            processes = n_cores_per_job,
+            processes = n_workers_per_job,
             cores = n_cores_per_job,
             memory = f'{3 * n_cores_per_job} GB', # Could turn this into a parameter for the config file
             job_extra_directives = [f'--{account=}', f'--{clusters=}', f'--{partition=}', f'--output={str(SLURM_info_files_dir)}/slurm-%j.out'],
